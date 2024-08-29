@@ -1,0 +1,254 @@
+import os
+import hashlib
+import fnmatch
+import time
+import numpy as np
+import cv2
+from imageio.v2 import imread
+import tkinter as tk
+from tkinter import scrolledtext, simpledialog, messagebox
+import webbrowser
+import functools
+
+# Pre-defined directories to scan
+DIRECTORIES = [
+    os.path.expanduser("~/Desktop"),
+    os.path.expanduser("~/Downloads"),
+    os.path.expanduser("~/Pictures"),
+    os.path.expanduser("~/Documents"),
+    os.path.expanduser("~/Music"),
+    os.path.expanduser("~/Videos"),
+]
+
+# Common utility functions
+def show_scrollable_popup(messages, title):
+    root = tk.Tk()
+    root.title(title)
+    
+    # Set window to full-screen initially
+    root.attributes('-fullscreen', True)
+    
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    # Define the tag for red-colored text
+    text_area.tag_configure('red', foreground='red')
+    
+    def open_file(file_path):
+        if os.path.exists(file_path):
+            webbrowser.open(f'file://{os.path.abspath(file_path)}')
+        else:
+            messagebox.showerror("Error", f"File not found: {file_path}")
+    
+    def on_enter(event):
+        text_area.config(cursor="hand2")
+    
+    def on_leave(event):
+        text_area.config(cursor="")
+    
+    for index, message in enumerate(messages):
+        lines = message.split('\n')
+        for line in lines:
+            if line.startswith("Original:") or line.startswith("Duplicate:"):
+                file_path = line.split(": ")[1]
+                text_area.insert(tk.END, line.split(": ")[0] + ": ")
+                start_index = text_area.index(tk.INSERT)
+                tag = f'clickable{index}_{lines.index(line)}'
+                
+                # Set red color for duplicate file paths
+                color_tag = 'red' if line.startswith("Duplicate:") else 'black'
+                
+                # Insert the file path without hyperlink appearance
+                text_area.insert(tk.END, file_path, (tag, color_tag))
+                text_area.tag_configure(tag, underline=False)
+                text_area.tag_bind(tag, '<Enter>', on_enter)
+                text_area.tag_bind(tag, '<Leave>', on_leave)
+                text_area.tag_bind(tag, '<Button-1>', 
+                                   functools.partial(lambda e, path=file_path: open_file(path)))
+                
+                # Insert timestamp in a new line
+                text_area.insert(tk.END, "\nModified: " + time.ctime(get_modification_time(file_path)) + "\n")
+            else:
+                text_area.insert(tk.END, line + "\n")
+    
+    text_area.config(state=tk.DISABLED)
+    
+    close_button = tk.Button(root, text="Close", command=root.destroy)
+    close_button.pack(pady=5)
+    
+    root.bind("<Escape>", lambda e: root.attributes('-fullscreen', False))
+
+    root.mainloop()
+
+# Function to get the modification time of a file
+def get_modification_time(file_path):
+    return os.path.getmtime(file_path)
+
+# Video duplicate finder
+def generate_md5(file_path, chunk_size=4096):
+    md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+def find_videos(directory, extensions=['*.mp4', '*.mkv', '*.avi']):
+    video_files = []
+    for root, _, filenames in os.walk(directory):
+        for ext in extensions:
+            for filename in fnmatch.filter(filenames, ext):
+                video_files.append(os.path.join(root, filename))
+    return video_files
+
+def check_video_duplicates(directories):
+    videos = []
+    for directory in directories:
+        videos.extend(find_videos(directory))
+    
+    video_hashes = {}
+    duplicate_messages = []
+    
+    for video in videos:
+        video_hash = generate_md5(video)
+        if video_hash in video_hashes:
+            original = video_hashes[video_hash]
+            original_time = get_modification_time(original)
+            duplicate_time = get_modification_time(video)
+            if duplicate_time > original_time:
+                duplicate_messages.append(f"Original: {original}\nModified: {time.ctime(original_time)}\nDuplicate: {video}\nModified: {time.ctime(duplicate_time)}\n")
+            else:
+                duplicate_messages.append(f"Original: {video}\nModified: {time.ctime(duplicate_time)}\nDuplicate: {original}\nModified: {time.ctime(original_time)}\n")
+        else:
+            video_hashes[video_hash] = video
+    
+    if duplicate_messages:
+        show_scrollable_popup(duplicate_messages, "Duplicate Videos Found")
+    else:
+        print("No duplicate videos found.")
+
+# Image duplicate finder
+def filter_images(images):
+    image_list = []
+    for image in images:
+        try:
+            img = imread(image)
+            assert img.shape[2] == 3
+            image_list.append(image)
+        except (AssertionError, OSError, ValueError) as e:
+            print(f"Skipping image {image}: {e}")
+    return image_list
+
+def img_gray(image):
+    image = imread(image)
+    return np.average(image, weights=[0.299, 0.587, 0.114], axis=2)
+
+def resize(image, height=30, width=30):
+    row_res = cv2.resize(image, (height, width), interpolation=cv2.INTER_AREA).flatten()
+    col_res = cv2.resize(image, (height, width), interpolation=cv2.INTER_AREA).flatten('F')
+    return row_res, col_res
+
+def intensity_diff(row_res, col_res):
+    difference_row = np.diff(row_res)
+    difference_col = np.diff(col_res)
+    difference_row = difference_row > 0
+    difference_col = difference_col > 0
+    return np.vstack((difference_row, difference_col)).flatten()
+
+def difference_score(image, height=30, width=30):
+    gray = img_gray(image)
+    row_res, col_res = resize(gray, height, width)
+    difference = intensity_diff(row_res, col_res)
+    return difference
+
+def difference_score_dict_hash(image_list):
+    ds_dict = {}
+    duplicates = []
+    for image in image_list:
+        ds = difference_score(image)
+        filehash = hashlib.md5(ds).hexdigest()
+        if filehash not in ds_dict:
+            ds_dict[filehash] = image
+        else:
+            original = ds_dict[filehash]
+            original_time = get_modification_time(original)
+            duplicate_time = get_modification_time(image)
+            if duplicate_time > original_time:
+                duplicates.append((image, original))
+            else:
+                duplicates.append((original, image))
+    return duplicates
+
+def check_image_duplicates(directories):
+    all_image_files = []
+    for dir_path in directories:
+        for root, _, files in os.walk(dir_path):
+            all_image_files += [os.path.join(root, file) for file in files if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+
+    image_files = filter_images(all_image_files)
+    duplicates = difference_score_dict_hash(image_files)
+    
+    if duplicates:
+        duplicate_messages = [f"Original: {dup[1]}\nModified: {time.ctime(get_modification_time(dup[1]))}\nDuplicate: {dup[0]}\nModified: {time.ctime(get_modification_time(dup[0]))}\n" for dup in duplicates]
+        show_scrollable_popup(duplicate_messages, "Duplicate Images Found")
+    else:
+        print("No duplicate images found.")
+
+# Text file duplicate finder
+def compute_md5(file_path):
+    hash_md5 = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+    except (PermissionError, FileNotFoundError) as e:
+        print(f"Skipping file due to error: {file_path} ({e})")
+        return None
+    return hash_md5.hexdigest()
+
+def find_text_duplicates(directories):
+    file_hashes = {}
+    duplicates = []
+
+    for directory in directories:
+        for root, _, files in os.walk(directory):
+            for file in files:
+                file_path = os.path.join(root, file)
+                if file.lower().endswith(('.txt', '.pdf', '.doc', '.docx', '.rtf', '.odt', '.tex', '.wpd')):
+                    file_hash = compute_md5(file_path)
+                    if file_hash:
+                        if file_hash in file_hashes:
+                            original = file_hashes[file_hash]
+                            original_time = get_modification_time(original)
+                            duplicate_time = get_modification_time(file_path)
+                            if duplicate_time > original_time:
+                                duplicates.append((file_path, original))
+                            else:
+                                duplicates.append((original, file_path))
+                        else:
+                            file_hashes[file_hash] = file_path
+
+    if duplicates:
+        duplicate_messages = [f"Original: {dup[1]}\nModified: {time.ctime(get_modification_time(dup[1]))}\nDuplicate: {dup[0]}\nModified: {time.ctime(get_modification_time(dup[0]))}\n" for dup in duplicates]
+        show_scrollable_popup(duplicate_messages, "Duplicate Text Files Found")
+    else:
+        print("No duplicate text files found.")
+
+# Main interactive script
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    
+    # Select the type of duplicates to search for
+    duplicate_type = simpledialog.askstring("Duplicate Finder", "Enter type of duplicates to find (video, image, text):").strip().lower()
+
+    if duplicate_type == "video":
+        check_video_duplicates(DIRECTORIES)
+    elif duplicate_type == "image":
+        check_image_duplicates(DIRECTORIES)
+    elif duplicate_type == "text":
+        find_text_duplicates(DIRECTORIES)
+    else:
+        messagebox.showerror("Error", "Invalid duplicate type.")
+
+if __name__ == "__main__":
+    main()
